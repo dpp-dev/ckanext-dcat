@@ -11,6 +11,7 @@ from rdflib.namespace import Namespace, RDF, XSD, SKOS, RDFS
 
 from geomet import wkt, InvalidGeoJSONException
 
+from ckan.model.license import LicenseRegister
 from ckan.plugins import toolkit
 
 from ckanext.dcat.utils import resource_uri, publisher_uri_from_dataset_dict
@@ -65,6 +66,10 @@ class RDFProfile(object):
         self.g = graph
 
         self.compatibility_mode = compatibility_mode
+
+        # Cache for mappings of licenses URL/title to ID built when needed in
+        # _license().
+        self._licenceregister_cache = None
 
     def _datasets(self):
         '''
@@ -307,6 +312,39 @@ class RDFProfile(object):
             'geom': geom,
         }
 
+    def _license(self, dataset_ref):
+        '''
+        Returns a license identifier if one of the distributions license is
+        found in CKAN license registry. If no distribution's license matches,
+        None is returned.
+
+        The first distribution with a license found in the registry is used so
+        that if distributions have different licenses we'll only get the first
+        one.
+        '''
+        if self._licenceregister_cache is not None:
+            license_uri2id, license_title2id = self._licenceregister_cache
+        else:
+            license_uri2id = {}
+            license_title2id = {}
+            for license_id, license in LicenseRegister().items():
+                license_uri2id[license.url] = license_id
+                license_title2id[license.title] = license_id
+            self._licenceregister_cache = license_uri2id, license_title2id
+
+        for distribution in self._distributions(dataset_ref):
+            # If distribution has a license, attach it to the dataset
+            license = self._object(distribution, DCT.license)
+            if license:
+                # Try to find a matching license comparing URIs, then titles
+                license_id = license_uri2id.get(license.toPython())
+                if license_id is None:
+                    license_id = license_title2id.get(
+                        self._object_value(license, DCT.title))
+                if license_id is not None:
+                    return license_id
+        return None
+
     def _distribution_format(self, distribution, normalize_ckan_format=True):
         '''
         Returns the Internet Media Type and format label for a distribution
@@ -421,16 +459,18 @@ class RDFProfile(object):
                                list_value=False,
                                date_value=False):
         for item in items:
-            key, predicate, fallbacks = item
+            key, predicate, fallbacks, _type = item
             self._add_triple_from_dict(_dict, subject, predicate, key,
                                        fallbacks=fallbacks,
                                        list_value=list_value,
-                                       date_value=date_value)
+                                       date_value=date_value,
+                                       _type=_type)
 
     def _add_triple_from_dict(self, _dict, subject, predicate, key,
                               fallbacks=None,
                               list_value=False,
-                              date_value=False):
+                              date_value=False,
+                              _type=Literal):
         '''
         Adds a new triple to the graph with the provided parameters
 
@@ -452,14 +492,14 @@ class RDFProfile(object):
                     break
 
         if value and list_value:
-            self._add_list_triple(subject, predicate, value)
+            self._add_list_triple(subject, predicate, value, _type)
         elif value and date_value:
-            self._add_date_triple(subject, predicate, value)
+            self._add_date_triple(subject, predicate, value, _type)
         elif value:
             # Normal text value
-            self.g.add((subject, predicate, Literal(value)))
+            self.g.add((subject, predicate, _type(value)))
 
-    def _add_list_triple(self, subject, predicate, value):
+    def _add_list_triple(self, subject, predicate, value, _type=Literal):
         '''
         Adds as many triples to the graph as values
 
@@ -475,6 +515,8 @@ class RDFProfile(object):
             try:
                 # JSON list
                 items = json.loads(value)
+                if isinstance(items, ((int, long, float, complex))):
+                    items = [items]
             except ValueError:
                 if ',' in value:
                     # Comma-separated list
@@ -484,9 +526,9 @@ class RDFProfile(object):
                     items = [value]
 
         for item in items:
-            self.g.add((subject, predicate, Literal(item)))
+            self.g.add((subject, predicate, _type(item)))
 
-    def _add_date_triple(self, subject, predicate, value):
+    def _add_date_triple(self, subject, predicate, value, _type=Literal):
         '''
         Adds a new triple with a date object
 
@@ -501,10 +543,10 @@ class RDFProfile(object):
             default_datetime = datetime.datetime(1, 1, 1, 0, 0, 0)
             _date = parse_date(value, default=default_datetime)
 
-            self.g.add((subject, predicate, Literal(_date.isoformat(),
-                                                    datatype=XSD.dateTime)))
+            self.g.add((subject, predicate, _type(_date.isoformat(),
+                                                  datatype=XSD.dateTime)))
         except ValueError:
-            self.g.add((subject, predicate, Literal(value)))
+            self.g.add((subject, predicate, _type(value)))
 
     def _last_catalog_modification(self):
         '''
@@ -588,6 +630,7 @@ class EuropeanDCATAPProfile(RDFProfile):
         dataset_dict['extras'] = []
         dataset_dict['resources'] = []
 
+
         # Basic fields
         for key, predicate in (
                 ('title', DCT.title),
@@ -634,7 +677,7 @@ class EuropeanDCATAPProfile(RDFProfile):
                 dataset_dict['extras'].append({'key': key, 'value': value})
 
         #  Lists
-        for key, predicate in (
+        for key, predicate, in (
                 ('language', DCT.language),
                 ('theme', DCAT.theme),
                 ('alternate_identifier', ADMS.identifier),
@@ -650,7 +693,7 @@ class EuropeanDCATAPProfile(RDFProfile):
             if values:
                 dataset_dict['extras'].append({'key': key,
                                                'value': json.dumps(values)})
-
+		
         # Contact details
         contact = self._contact_details(dataset_ref, DCAT.contactPoint)
         if not contact:
@@ -694,6 +737,10 @@ class EuropeanDCATAPProfile(RDFProfile):
                        if isinstance(dataset_ref, rdflib.term.URIRef)
                        else None)
         dataset_dict['extras'].append({'key': 'uri', 'value': dataset_uri})
+
+        # License
+        if 'license_id' not in dataset_dict:
+            dataset_dict['license_id'] = self._license(dataset_ref)
 
         # Resources
         for distribution in self._distributions(dataset_ref):
@@ -781,7 +828,6 @@ class EuropeanDCATAPProfile(RDFProfile):
         return dataset_dict
 
     def graph_from_dataset(self, dataset_dict, dataset_ref):
-
         g = self.g
 
         for prefix, namespace in namespaces.iteritems():
@@ -791,14 +837,20 @@ class EuropeanDCATAPProfile(RDFProfile):
 
         # Basic fields
         items = [
-            ('title', DCT.title, None),
-            ('notes', DCT.description, None),
-            ('url', DCAT.landingPage, None),
-            ('identifier', DCT.identifier, ['guid', 'id']),
-            ('version', OWL.versionInfo, ['dcat_version']),
-            ('version_notes', ADMS.versionNotes, None),
-            ('frequency', DCT.accrualPeriodicity, None),
-            ('access_rights', DCT.accessRights, None),
+            ('title', DCT.title, None, Literal),
+            ('notes', DCT.description, None, Literal),
+            ('url', DCAT.landingPage, None, URIRef),
+            ('identifier', DCT.identifier, ['guid', 'id'], Literal),  # FIXME: Should use the global unique identifer
+            ('version', OWL.versionInfo, ['dcat_version'], Literal),
+            ('version_notes', ADMS.versionNotes, None, Literal),
+            ('frequency', DCT.accrualPeriodicity, None, URIRef),
+            ('access_rights', DCT.accessRights, None, URIRef),
+            ('access_rights_comment', DCT.accessRightsComment, None, URIRef),
+            ('subject', DCT.subject, None, URIRef),
+            ('provenance', DCT.provenance, None, URIRef),
+            ('type', DCT.type, None, URIRef),
+            ('creator', DCT.creator, None, URIRef),
+            ('is_part_of', DCT.ispartof, None, URIRef)
         ]
         self._add_triples_from_dict(dataset_dict, dataset_ref, items)
 
@@ -806,25 +858,38 @@ class EuropeanDCATAPProfile(RDFProfile):
         for tag in dataset_dict.get('tags', []):
             g.add((dataset_ref, DCAT.keyword, Literal(tag['name'])))
 
+        for group in dataset_dict['groups']:
+            dict = {}
+            dict['id'] = group['name']
+            group_dict = toolkit.get_action('group_show')(None, dict)
+            val = None
+            for extra in group_dict['extras']:
+                if extra['key'] == 'eurovoc':
+                    val = extra['value']
+                    break
+            if val == None:
+                continue
+            g.add((dataset_ref, DCAT.theme, URIRef(val)))
+            #print dataset_dict['groups']
+
         # Dates
         items = [
-            ('issued', DCT.issued, ['metadata_created']),
-            ('modified', DCT.modified, ['metadata_modified']),
+            ('issued', DCT.issued, ['metadata_created'], Literal),
+            ('modified', DCT.modified, ['metadata_modified'], Literal),
         ]
         self._add_date_triples_from_dict(dataset_dict, dataset_ref, items)
 
         #  Lists
         items = [
-            ('language', DCT.language, None),
-            ('theme', DCAT.theme, None),
-            ('conforms_to', DCT.conformsTo, None),
-            ('alternate_identifier', ADMS.identifier, None),
-            ('documentation', FOAF.page, None),
-            ('related_resource', DCT.relation, None),
-            ('has_version', DCT.hasVersion, None),
-            ('is_version_of', DCT.isVersionOf, None),
-            ('source', DCT.source, None),
-            ('sample', ADMS.sample, None),
+            ('language', DCT.language, None, URIRef),
+            ('conforms_to', DCT.conformsTo, None, URIRef),
+            ('alternate_identifier', ADMS.identifier, None, Literal),
+            ('documentation', FOAF.page, None, URIRef),
+            ('related_resource', DCT.relation, None, URIRef),
+            ('has_version', DCT.hasVersion, None, Literal),
+            ('is_version_of', DCT.isVersionOf, None, Literal),
+            ('source', DCT.source, None, Literal),
+            ('sample', ADMS.sample, None, Literal),
         ]
         self._add_list_triples_from_dict(dataset_dict, dataset_ref, items)
 
@@ -845,13 +910,13 @@ class EuropeanDCATAPProfile(RDFProfile):
             else:
                 contact_details = BNode()
 
-            g.add((contact_details, RDF.type, VCARD.Organization))
+            g.add((contact_details, RDF.type, VCARD.Kind))  # FIXME: DIFI doesn't like VCARD.Organization
             g.add((dataset_ref, DCAT.contactPoint, contact_details))
 
             items = [
-                ('contact_name', VCARD.fn, ['maintainer', 'author']),
+                ('contact_name', VCARD.fn, ['maintainer', 'author'], Literal),
                 ('contact_email', VCARD.hasEmail, ['maintainer_email',
-                                                   'author_email']),
+                                                   'author_email'], Literal),
             ]
 
             self._add_triples_from_dict(dataset_dict, contact_details, items)
@@ -870,7 +935,7 @@ class EuropeanDCATAPProfile(RDFProfile):
                 # No organization nor publisher_uri
                 publisher_details = BNode()
 
-            g.add((publisher_details, RDF.type, FOAF.Organization))
+            g.add((publisher_details, RDF.type, FOAF.Agent))  # FIXME: DIFI doesn't like FOAF.Organization
             g.add((dataset_ref, DCT.publisher, publisher_details))
 
             publisher_name = self._get_dataset_value(dataset_dict, 'publisher_name')
@@ -883,9 +948,9 @@ class EuropeanDCATAPProfile(RDFProfile):
             # `organization` object in the dataset_dict does not include
             # custom fields
             items = [
-                ('publisher_email', FOAF.mbox, None),
-                ('publisher_url', FOAF.homepage, None),
-                ('publisher_type', DCT.type, None),
+                ('publisher_email', FOAF.mbox, None, Literal),
+                ('publisher_url', FOAF.homepage, None, URIRef),
+                ('publisher_type', DCT.type, None, Literal),
             ]
 
             self._add_triples_from_dict(dataset_dict, publisher_details, items)
@@ -944,22 +1009,27 @@ class EuropeanDCATAPProfile(RDFProfile):
 
             g.add((distribution, RDF.type, DCAT.Distribution))
 
+            if 'license' not in resource_dict and 'license_id' in dataset_dict:
+                lr = LicenseRegister()
+                _license = lr.get(dataset_dict['license_id'])
+                resource_dict['license'] = _license.url
+
             #  Simple values
             items = [
-                ('name', DCT.title, None),
-                ('description', DCT.description, None),
-                ('status', ADMS.status, None),
-                ('rights', DCT.rights, None),
-                ('license', DCT.license, None),
+                ('name', DCT.title, None, Literal),
+                ('description', DCT.description, None, Literal),
+                ('status', ADMS.status, None, Literal),
+                ('rights', DCT.rights, None, Literal),
+                ('license', DCT.license, None, URIRef),
             ]
 
             self._add_triples_from_dict(resource_dict, distribution, items)
 
             #  Lists
             items = [
-                ('documentation', FOAF.page, None),
-                ('language', DCT.language, None),
-                ('conforms_to', DCT.conformsTo, None),
+                ('documentation', FOAF.page, None, URIRef),
+                ('language', DCT.language, None, URIRef),
+                ('conforms_to', DCT.conformsTo, None, URIRef),
             ]
             self._add_list_triples_from_dict(resource_dict, distribution, items)
 
@@ -980,14 +1050,14 @@ class EuropeanDCATAPProfile(RDFProfile):
             url = resource_dict.get('url')
             download_url = resource_dict.get('download_url')
             if download_url:
-                g.add((distribution, DCAT.downloadURL, Literal(download_url)))
+                g.add((distribution, DCAT.downloadURL, URIRef(download_url)))
             if (url and not download_url) or (url and url != download_url):
-                g.add((distribution, DCAT.accessURL, Literal(url)))
+                g.add((distribution, DCAT.accessURL, URIRef(url)))
 
             # Dates
             items = [
-                ('issued', DCT.issued, None),
-                ('modified', DCT.modified, None),
+                ('issued', DCT.issued, None, Literal),
+                ('modified', DCT.modified, None, Literal),
             ]
 
             self._add_date_triples_from_dict(resource_dict, distribution, items)
@@ -1028,19 +1098,19 @@ class EuropeanDCATAPProfile(RDFProfile):
 
         # Basic fields
         items = [
-            ('title', DCT.title, config.get('ckan.site_title')),
-            ('description', DCT.description, config.get('ckan.site_description')),
-            ('homepage', FOAF.homepage, config.get('ckan.site_url')),
-            ('language', DCT.language, config.get('ckan.locale_default', 'en')),
+            ('title', DCT.title, config.get('ckan.site_title'), Literal),
+            ('description', DCT.description, config.get('ckan.site_description'), Literal),
+            ('homepage', FOAF.homepage, config.get('ckan.site_url'), URIRef),
+            ('language', DCT.language, config.get('ckan.locale_default', 'en'), Literal),
         ]
         for item in items:
-            key, predicate, fallback = item
+            key, predicate, fallback, _type = item
             if catalog_dict:
                 value = catalog_dict.get(key, fallback)
             else:
                 value = fallback
             if value:
-                g.add((catalog_ref, predicate, Literal(value)))
+                g.add((catalog_ref, predicate, _type(value)))
 
         # Dates
         modified = self._last_catalog_modification()
