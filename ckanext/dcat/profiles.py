@@ -15,7 +15,6 @@ from ckan.model.license import LicenseRegister
 from ckan.plugins import toolkit
 
 from ckanext.dcat.utils import resource_uri, publisher_uri_from_dataset_dict
-
 DCT = Namespace("http://purl.org/dc/terms/")
 DCAT = Namespace("http://www.w3.org/ns/dcat#")
 ADMS = Namespace("http://www.w3.org/ns/adms#")
@@ -630,13 +629,16 @@ class EuropeanDCATAPProfile(RDFProfile):
         dataset_dict['extras'] = []
         dataset_dict['resources'] = []
 
-
         # Basic fields
         for key, predicate in (
                 ('title', DCT.title),
                 ('notes', DCT.description),
                 ('url', DCAT.landingPage),
                 ('version', OWL.versionInfo),
+                ('frequency', DCT.accrualPeriodicity),
+                ('language', DCT.language),
+                ('issued', DCT.issued),
+                ('modified', DCT.modified),
                 ):
             value = self._object_value(dataset_ref, predicate)
             if value:
@@ -647,7 +649,14 @@ class EuropeanDCATAPProfile(RDFProfile):
             value = self._object_value(dataset_ref, ADMS.version)
             if value:
                 dataset_dict['version'] = value
-
+        
+        # Contact details
+        contact = self._contact_details(dataset_ref, DCAT.contactPoint)
+        if contact:
+            if contact.get('name'):
+                dataset_dict['maintainer'] = contact.get('name')
+            if contact.get('email'):
+                dataset_dict['maintainer_email'] = contact.get('email')
         # Tags
         keywords = self._object_value_list(dataset_ref, DCAT.keyword) or []
         # Split keywords with commas
@@ -658,90 +667,10 @@ class EuropeanDCATAPProfile(RDFProfile):
 
         for keyword in keywords:
             dataset_dict['tags'].append({'name': keyword})
-
-        # Extras
-
-        #  Simple values
-        for key, predicate in (
-                ('issued', DCT.issued),
-                ('modified', DCT.modified),
-                ('identifier', DCT.identifier),
-                ('version_notes', ADMS.versionNotes),
-                ('frequency', DCT.accrualPeriodicity),
-                ('access_rights', DCT.accessRights),
-                ('provenance', DCT.provenance),
-                ('dcat_type', DCT.type),
-                ):
-            value = self._object_value(dataset_ref, predicate)
-            if value:
-                dataset_dict['extras'].append({'key': key, 'value': value})
-
-        #  Lists
-        for key, predicate, in (
-                ('language', DCT.language),
-                ('theme', DCAT.theme),
-                ('alternate_identifier', ADMS.identifier),
-                ('conforms_to', DCT.conformsTo),
-                ('documentation', FOAF.page),
-                ('related_resource', DCT.relation),
-                ('has_version', DCT.hasVersion),
-                ('is_version_of', DCT.isVersionOf),
-                ('source', DCT.source),
-                ('sample', ADMS.sample),
-                ):
-            values = self._object_value_list(dataset_ref, predicate)
-            if values:
-                dataset_dict['extras'].append({'key': key,
-                                               'value': json.dumps(values)})
-		
-        # Contact details
-        contact = self._contact_details(dataset_ref, DCAT.contactPoint)
-        if not contact:
-            # adms:contactPoint was supported on the first version of DCAT-AP
-            contact = self._contact_details(dataset_ref, ADMS.contactPoint)
-
-        if contact:
-            for key in ('uri', 'name', 'email'):
-                if contact.get(key):
-                    dataset_dict['extras'].append(
-                        {'key': 'contact_{0}'.format(key),
-                         'value': contact.get(key)})
-
-        # Publisher
-        publisher = self._publisher(dataset_ref, DCT.publisher)
-        for key in ('uri', 'name', 'email', 'url', 'type'):
-            if publisher.get(key):
-                dataset_dict['extras'].append(
-                    {'key': 'publisher_{0}'.format(key),
-                     'value': publisher.get(key)})
-
-        # Temporal
-        start, end = self._time_interval(dataset_ref, DCT.temporal)
-        if start:
-            dataset_dict['extras'].append(
-                {'key': 'temporal_start', 'value': start})
-        if end:
-            dataset_dict['extras'].append(
-                {'key': 'temporal_end', 'value': end})
-
-        # Spatial
-        spatial = self._spatial(dataset_ref, DCT.spatial)
-        for key in ('uri', 'text', 'geom'):
-            if spatial.get(key):
-                dataset_dict['extras'].append(
-                    {'key': 'spatial_{0}'.format(key) if key != 'geom' else 'spatial',
-                     'value': spatial.get(key)})
-
-        # Dataset URI (explicitly show the missing ones)
-        dataset_uri = (unicode(dataset_ref)
-                       if isinstance(dataset_ref, rdflib.term.URIRef)
-                       else None)
-        dataset_dict['extras'].append({'key': 'uri', 'value': dataset_uri})
-
-        # License
+        
         if 'license_id' not in dataset_dict:
             dataset_dict['license_id'] = self._license(dataset_ref)
-
+        
         # Resources
         for distribution in self._distributions(dataset_ref):
 
@@ -755,7 +684,7 @@ class EuropeanDCATAPProfile(RDFProfile):
                     ('issued', DCT.issued),
                     ('modified', DCT.modified),
                     ('status', ADMS.status),
-                    ('rights', DCT.rights),
+                    ('maintainer', DCT.rights),
                     ('license', DCT.license),
                     ):
                 value = self._object_value(distribution, predicate)
@@ -812,27 +741,15 @@ class EuropeanDCATAPProfile(RDFProfile):
 
             dataset_dict['resources'].append(resource_dict)
 
-        if self.compatibility_mode:
-            # Tweak the resulting dict to make it compatible with previous
-            # versions of the ckanext-dcat parsers
-            for extra in dataset_dict['extras']:
-                if extra['key'] in ('issued', 'modified', 'publisher_name',
-                                    'publisher_email',):
-
-                    extra['key'] = 'dcat_' + extra['key']
-
-                if extra['key'] == 'language':
-                    extra['value'] = ','.join(
-                        sorted(json.loads(extra['value'])))
 
         return dataset_dict
 
     def graph_from_dataset(self, dataset_dict, dataset_ref):
         g = self.g
-
         for prefix, namespace in namespaces.iteritems():
             g.bind(prefix, namespace)
 
+        #g.add((catalog_ref, RDF.type, DCAT.Catalog))
         g.add((dataset_ref, RDF.type, DCAT.Dataset))
 
         # Basic fields
