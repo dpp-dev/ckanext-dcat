@@ -938,6 +938,7 @@ class EuropeanDCATAPProfile(RDFProfile):
                 ('status', ADMS.status, None, Literal),
                 ('rights', DCT.rights, None, Literal),
                 ('license', DCT.license, None, URIRef),
+                ('conformsTo', DCT.conformsTo, None, URIRef),
             ]
 
             self._add_triples_from_dict(resource_dict, distribution, items)
