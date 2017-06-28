@@ -926,10 +926,10 @@ class EuropeanDCATAPProfile(RDFProfile):
 
             g.add((distribution, RDF.type, DCAT.Distribution))
 
-            if 'license' not in resource_dict and 'license_id' in dataset_dict:
-                lr = LicenseRegister()
-                _license = lr.get(dataset_dict['license_id'])
-                resource_dict['license'] = _license.url
+            #if 'license' not in resource_dict and 'license_id' in dataset_dict:
+                #lr = LicenseRegister()
+                #_license = lr.get(dataset_dict['license_id'])
+                #resource_dict['license'] = _license.url
 
             #  Simple values
             items = [
